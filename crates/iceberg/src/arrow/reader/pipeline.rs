@@ -73,14 +73,25 @@ impl ArrowReader {
                     .try_flatten(),
             )
         } else {
+            // Open each file inside the stream that reads it, so that every
+            // request in flight belongs to a stream `try_flatten_unordered`
+            // polls. Opening files ahead of time in a `try_buffer_unordered`
+            // would stall a scan: once `concurrency_limit_data_files` files are
+            // streaming, the flatten stops polling the buffer, and the metadata
+            // reads it has in flight go unread. On a connection that HTTP/2
+            // multiplexes (GCS, for one), unread responses hold flow-control
+            // window, and enough of them starve the reads being polled.
             Box::pin(
                 tasks
-                    .map_ok(move |task| task_reader.clone().process(task))
+                    .map_ok(move |task| {
+                        futures::stream::once(task_reader.clone().process(task))
+                            .try_flatten()
+                            .boxed()
+                    })
                     .map_err(|err| {
                         Error::new(ErrorKind::Unexpected, "file scan task generate failed")
                             .with_source(err)
                     })
-                    .try_buffer_unordered(concurrency_limit_data_files)
                     .try_flatten_unordered(concurrency_limit_data_files),
             )
         };
